@@ -16,6 +16,17 @@ http_archive(
 )
 
 http_archive(
+    name = "bazel_skylib",
+    urls = [
+        "https://mirror.bazel.build/github.com/bazelbuild/bazel-skylib/releases/download/1.0.2/bazel-skylib-1.0.2.tar.gz",
+        "https://github.com/bazelbuild/bazel-skylib/releases/download/1.0.2/bazel-skylib-1.0.2.tar.gz",
+    ],
+    sha256 = "97e70364e9249702246c0e9444bccdc4b847bed1eb03c5a3ece4f83dfe6abc44",
+)
+load("@bazel_skylib//:workspace.bzl", "bazel_skylib_workspace")
+bazel_skylib_workspace()
+
+http_archive(
     name = "gtest",
     strip_prefix = "googletest-34e92be31cf457ad4054b7908ee5e0e214dbcddc",
     urls = [
@@ -49,9 +60,9 @@ http_archive(
     name = "half",
     build_file = "//third_party:half.BUILD",
     urls = [
-      "https://ayera.dl.sourceforge.net/project/half/half/1.12.0/half-1.12.0.zip",
+      "https://downloads.sourceforge.net/project/half/half/2.1.0/half-2.1.0.zip",
     ],
-    sha256 = "cdd70d3bf3fe091b688e7ab3f48471c881a197d2c186c95cca8bf156961fb41c",
+    sha256 = "ad1788afe0300fa2b02b0d1df128d857f021f92ccf7c8bddd07812685fa07a25",
 )
 
 # ===== cuda and libnuma need to be configured for the platform =====

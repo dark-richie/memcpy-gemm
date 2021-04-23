@@ -22,7 +22,6 @@
 
 #include "absl/strings/string_view.h"
 #include "src/gemm_test_lib.h"
-#include "src/matrix_lib.h"
 #include "src/memory_allocator_interface.h"
 #include "src/multi_gemm_lib.h"
 #include "cuda/include/cublas_api.h"
@@ -31,14 +30,52 @@
 #if CUDA_VERSION >= 10010
 #include "cuda/include/cublasLt.h"
 #endif
+#if CUDA_VERSION >= BF16_CUDA_VERSION
+#include "cuda/include/cuda_bf16.h"
+#endif
 
 namespace platforms_gpus {
 namespace gemm_test {
 namespace internal {
 
+enum class kPtrType { kDevicePtr = 0, kHostPtr = 1 };
+struct GEMMData {
+  const void *alpha = nullptr;
+  const void *beta = nullptr;
+  const void *matA = nullptr;
+  const void *matB = nullptr;
+  void *matC = nullptr;
+  kPtrType scalePtrType = kPtrType::kDevicePtr;
+};
+
+struct Algo {
+  cublasGemmAlgo_t cublas_algo_ = CUBLAS_GEMM_DFALT;
+#if CUDA_VERSION >= 10010
+  absl::optional<cublasLtMatmulAlgo_t> cublasLt_algo_;
+#endif  // CUDA_VERSION >= 10010
+};
+
+struct MatricesInfo {
+  static constexpr uint64_t kDefaultMatrixSize = 128;
+  GEMMData gemmData;
+  uint64_t m = kDefaultMatrixSize;
+  uint64_t n = kDefaultMatrixSize;
+  uint64_t k = kDefaultMatrixSize;
+  cudaDataType_t input_data_type = CUDA_R_64F;
+  cudaDataType_t output_data_type = CUDA_R_64F;
+  cudaDataType_t compute_data_type = CUDA_R_64F;
+  int64_t lda = kDefaultMatrixSize;
+  int64_t ldb = kDefaultMatrixSize;
+  int64_t ldc = kDefaultMatrixSize;
+  cublasOperation_t opA = CUBLAS_OP_N;
+  cublasOperation_t opB = CUBLAS_OP_N;
+};
+
 // This abstract class serves as an interface for cuda cublasGemmEx API that
 // utilized by gemm_test. The actual backend cuBLAS call depends on the data
-// types and GPU compute capability.
+// types and GPU compute capability. This class is also responsible for
+// backend-dependent setup. Each compute thread should have a single compute
+// interface.
 class GpuComputationInterface {
  public:
   virtual ~GpuComputationInterface() {}
@@ -47,14 +84,17 @@ class GpuComputationInterface {
   // selected with cudaSetDevice(), or GPU 0 by default. Setup is separated from
   // constructor code so that the correct implementation of this interface can
   // be determined separately from GPU selection.
-  virtual void Initialize(cudaStream_t stream,
-                          const ContextOption &context_options) = 0;
+  virtual void Initialize(cudaStream_t stream) = 0;
+
+  // Initialize the Matrix multiply A,B,C data params
+  virtual void BindGemmMatrices(const ContextOption &context_options,
+                                GEMMData &gemmData) = 0;
 
   // Executes a computation cycle. The backend cuBLAS function call depends on
   // the GPU architecture and potentially the CUDA version.
-  virtual cublasStatus_t MatrixMultiComputation(
-      const ContextOption &context_options, const void *alpha, const void *A,
-      const void *B, const void *beta, void *C) = 0;
+  virtual cublasStatus_t MatrixMultiComputation(const Algo &algo) = 0;
+
+ protected:
 };
 
 // Modern interface for compute capability >= 5.0. Allows half and mixed
@@ -65,16 +105,16 @@ class CudaCublasInterface final : public GpuComputationInterface {
 
   ~CudaCublasInterface() override;
 
-  cublasStatus_t MatrixMultiComputation(const ContextOption &context_options,
-                                        const void *alpha, const void *A,
-                                        const void *B, const void *beta,
-                                        void *C) override;
+  cublasStatus_t MatrixMultiComputation(const Algo &algo) override;
 
-  void Initialize(cudaStream_t stream,
-                  const ContextOption &context_options) override;
+  void Initialize(cudaStream_t stream) override;
+
+  void BindGemmMatrices(const ContextOption &context_options,
+                        GEMMData &gemmData) override;
 
  private:
   cublasHandle_t cublas_handle_ = nullptr;
+  MatricesInfo matrices_info_;
 };
 
 // Legacy interface for compute capability <= 5 (k80 and earlier). Supports
@@ -86,44 +126,48 @@ class LegacyCudaCublasInterface final : public GpuComputationInterface {
 
   ~LegacyCudaCublasInterface() override;
 
-  cublasStatus_t MatrixMultiComputation(const ContextOption &context_options,
-                                        const void *alpha, const void *A,
-                                        const void *B, const void *beta,
-                                        void *C) override;
+  cublasStatus_t MatrixMultiComputation(const Algo &algo) override;
 
-  void Initialize(cudaStream_t stream,
-                  const ContextOption &context_options) override;
+  void Initialize(cudaStream_t stream) override;
+
+  void BindGemmMatrices(const ContextOption &context_options,
+                        GEMMData &gemmData) override;
 
  private:
   cublasHandle_t cublas_handle_ = nullptr;
+  MatricesInfo matrices_info_;
 };
 
 #if CUDA_VERSION >= 10010
-// cublasLT backend for int8 tensor operations.
-class CudaInt8TensorInterface final : public GpuComputationInterface {
+class CudaCublasLtInterface final : public GpuComputationInterface {
  public:
-  CudaInt8TensorInterface() {}
+  CudaCublasLtInterface() {}
+  ~CudaCublasLtInterface() override;
 
-  ~CudaInt8TensorInterface() override;
+  cublasStatus_t MatrixMultiComputation(const Algo &algo) override;
 
-  cublasStatus_t MatrixMultiComputation(const ContextOption &context_options,
-                                        const void *alpha, const void *A,
-                                        const void *B, const void *beta,
-                                        void *C) override;
+  void Initialize(cudaStream_t stream) override;
 
-  void Initialize(cudaStream_t stream,
-                  const ContextOption &context_options) override;
+  void BindGemmMatrices(const ContextOption &context_options,
+                        GEMMData &gemmData) override;
+
+  std::vector<cublasLtMatmulHeuristicResult_t> GetHeuristicResults(int maxNum);
 
  private:
-  // Layout description constants.
-  static constexpr cublasLtOrder_t kMatrixACLayout = CUBLASLT_ORDER_COL32;
-  static constexpr cublasLtOrder_t kMatrixBLayout = CUBLASLT_ORDER_COL4_4R2_8C;
+  void FreeReuseResource();
+
+ private:
   // Transpose operation constants.
   static constexpr cublasOperation_t kTransOpA = CUBLAS_OP_N;
   static constexpr cublasOperation_t kTransOpB = CUBLAS_OP_T;
   // Pointer mode constant.
   static constexpr cublasPointerMode_t kPointerMode =
       CUBLAS_POINTER_MODE_DEVICE;
+  static constexpr int kAlpha = 1;
+  static constexpr int kBeta = 0;
+
+  size_t workspacesize_ = 0;
+  void *workspace_ = nullptr;
 
   cublasLtHandle_t cublas_handle_ = nullptr;
   // There is no cublasSetStream equivalent for cublasLT. Instead, we store
@@ -135,22 +179,37 @@ class CudaInt8TensorInterface final : public GpuComputationInterface {
   cublasLtMatrixLayout_t layout_a_ = nullptr;
   cublasLtMatrixLayout_t layout_b_ = nullptr;
   cublasLtMatrixLayout_t layout_c_ = nullptr;
+
+  // allocated memory for transformed data
+  void *mat_a_ = nullptr;
+  void *mat_b_ = nullptr;
+  void *mat_c_ = nullptr;
+
+  // non transformed layout descriptor
+  cublasLtMatrixLayout_t orig_a_ = nullptr;
+  cublasLtMatrixLayout_t orig_b_ = nullptr;
+  cublasLtMatrixLayout_t orig_c_ = nullptr;
+
+  // transform descriptor
+  cublasLtMatrixTransformDesc_t transform_desc_ = nullptr;
+
+ private:
+  MatricesInfo matrices_info_;
 };
 #endif  // CUDA_VERSION >= 10010
 
 // Selects and creates a GEMM interface based on the precision of computation to
 // be done and the capabilities of the GPU.
 std::unique_ptr<GpuComputationInterface> SelectGemmInterface(
-    absl::string_view input_type, absl::string_view output_type,
-    absl::string_view compute_type, float compute_capability);
+    const ContextOption &options, const ComputeCapability &compute_capability);
 
 // GpuDataHandler stores pointers to GPU data, and handles allocation and
 // freeing of those pointers. A GpuDataHandler is assigned to a single GPU.
 // Allocation failures lead to immediate program exit.
 // TODO: Return error status rather than crashing program on
 // CUDA allocation failures.
-// TODO: Template on compute type.
-template <typename InputPrecision, typename OutputPrecision>
+template <typename InputPrecision, typename OutputPrecision,
+          typename ComputePrecision>
 class GpuDataHandler {
  public:
   GpuDataHandler() = default;
@@ -162,35 +221,23 @@ class GpuDataHandler {
                   const RandomMatrix<InputPrecision> *data_in_b,
                   const cudaStream_t stream);
 
-  void SetComputeType(absl::string_view compute_type) {
-    compute_type_ = compute_type;
-  }
+  // Changes the GPU to which data will be copied.
   void SetGpuId(const int id) { gpu_id_ = id; }
 
   // Accessors.
   InputPrecision *InputA() const { return input_a_; }
   InputPrecision *InputB() const { return input_b_; }
   OutputPrecision *Output() const { return output_; }
-  void *Alpha() const { return alpha_; }
-  void *Beta() const { return beta_; }
+  void *Alpha() const { return static_cast<void *>(alpha_); }
+  void *Beta() const { return static_cast<void *>(beta_); }
 
  private:
   // Data will be allocated on this GPU
   int gpu_id_ = 0;
 
-  // Precision in which GEMM operations on this data will be performed. This
-  // determines the data type of the scaling factors. Must be one of "single"
-  // "double", "half", or "int32".
-  std::string compute_type_;
-
-  // Input (alpha_) and output (beta_) scaling factors. On the device these
-  // factors should be the same type as ComputeType The addresses for
-  // alpha_ and beta_should be aligned with ComputeType.
-  // Note that ComputeType could be different than the input or output types.
-  // One example is that both input and output matrices are half type, while
-  // ComputeType could be float type.
-  void *alpha_ = nullptr;
-  void *beta_ = nullptr;
+  // Input (alpha_) and output (beta_) scaling factors.
+  ComputePrecision *alpha_ = nullptr;
+  ComputePrecision *beta_ = nullptr;
 
   // Input and output matrices.
   InputPrecision *input_a_ = nullptr;
@@ -200,8 +247,7 @@ class GpuDataHandler {
 
 // Derived and templated classes of HostContext class. Used to instantiate
 // HostContext with different data input/output combinations.
-// TODO: Template on compute type.
-template <typename P_in, typename P_out>
+template <typename P_in, typename P_out, typename P_compute>
 class MixedPrecisionHostContext : public HostContext {
  public:
   explicit MixedPrecisionHostContext(const ContextOption &options);
@@ -221,7 +267,7 @@ class MixedPrecisionHostContext : public HostContext {
 
 // Derived and templated classes of GpuContext class. Used to instantiate
 // GpuContext with different data input/output combinations.
-template <typename P_in, typename P_out>
+template <typename P_in, typename P_out, typename P_compute>
 class MixedPrecisionGpuContext : public GpuContext {
  public:
   MixedPrecisionGpuContext(
@@ -237,26 +283,37 @@ class MixedPrecisionGpuContext : public GpuContext {
 
   void LaunchKernel() override;
 
+  void AutoTuning() override;
+
  protected:
-  GpuDataHandler<P_in, P_out> data_handler_;
+  GpuDataHandler<P_in, P_out, P_compute> data_handler_;
   cudaStream_t stream_;
   std::unique_ptr<GpuComputationInterface> compute_interface_;
 };
 
-extern template class GpuDataHandler<half_float::half, half_float::half>;
-extern template class GpuDataHandler<half_float::half, float>;
-extern template class GpuDataHandler<float, float>;
-extern template class GpuDataHandler<double, double>;
-extern template class GpuDataHandler<int8_t, int32_t>;
-extern template class GpuDataHandler<int8_t, float>;
+extern template class GpuDataHandler<half_float::half, half_float::half,
+                                     half_float::half>;
+extern template class GpuDataHandler<half_float::half, float, float>;
+extern template class GpuDataHandler<float, float, float>;
+extern template class GpuDataHandler<double, double, double>;
+extern template class GpuDataHandler<int8_t, int32_t, int32_t>;
+extern template class GpuDataHandler<int8_t, float, float>;
 
-extern template class MixedPrecisionHostContext<half_float::half,
-                                                half_float::half>;
-extern template class MixedPrecisionHostContext<half_float::half, float>;
-extern template class MixedPrecisionHostContext<float, float>;
-extern template class MixedPrecisionHostContext<double, double>;
-extern template class MixedPrecisionHostContext<int8_t, int32_t>;
-extern template class MixedPrecisionHostContext<int8_t, float>;
+extern template class MixedPrecisionHostContext<
+    half_float::half, half_float::half, half_float::half>;
+extern template class MixedPrecisionHostContext<half_float::half, float, float>;
+extern template class MixedPrecisionHostContext<float, float, float>;
+extern template class MixedPrecisionHostContext<double, double, double>;
+extern template class MixedPrecisionHostContext<int8_t, int32_t, int32_t>;
+extern template class MixedPrecisionHostContext<int8_t, float, float>;
+
+#if CUDA_VERSION >= BF16_CUDA_VERSION
+extern template class GpuDataHandler<nv_bfloat16, nv_bfloat16, float>;
+extern template class MixedPrecisionHostContext<nv_bfloat16, nv_bfloat16,
+                                                float>;
+extern template class GpuDataHandler<nv_bfloat16, float, float>;
+extern template class MixedPrecisionHostContext<nv_bfloat16, float, float>;
+#endif
 
 }  // namespace internal
 }  // namespace gemm_test

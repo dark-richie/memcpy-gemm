@@ -42,6 +42,14 @@ class MemcpyGemmTest(unittest.TestCase):
         '--gpus=0',
         '--flows=c0-g0-a0 g0-c0-a1',
     ]
+    self.sm_copy_memcpy_args = [
+        os.path.abspath(exec_path),
+        '--duration={}s'.format(self.duration_s),
+        # Tests running on forge can only use 1 GPU.
+        '--gpus=0',
+        '--flows=g0-g0-a0 g0-g0-a1',
+        '--use_cudacomputecopy',
+    ]
 
   def ValidateOutput(self, output):
     nr_matches = 0
@@ -77,7 +85,8 @@ class MemcpyGemmTest(unittest.TestCase):
   def testMixedHalfFloat(self):
     args = self.memcpy_gemm_args + [
         '--gemm', '--input_precision=half', '--output_precision=single',
-        '--compute_precision=single', '--N=1024', '--M=1024', '--K=1024'
+        '--compute_precision=single', '--N=1024', '--M=1024', '--K=1024',
+        '--gemm_autotune=1'
     ]
     result = subprocess.run(
         args, timeout=self.timeout_s, stdout=subprocess.PIPE)
@@ -139,6 +148,11 @@ class MemcpyGemmTest(unittest.TestCase):
           args, timeout=self.timeout_s, stdout=subprocess.PIPE)
       self.assertEqual(result.returncode, 0)
       self.ValidateOutput(result.stdout)
+    # test sm copy
+    result = subprocess.run(
+        self.sm_copy_memcpy_args, timeout=self.timeout_s, stdout=subprocess.PIPE)
+    self.assertEqual(result.returncode, 0)
+    self.ValidateOutput(result.stdout)
 
   def testFlowModels(self):
     options = ['--flow_model=thread-per-gpu', '--flow_model=event-poll']
@@ -157,6 +171,20 @@ class MemcpyGemmTest(unittest.TestCase):
         args, timeout=self.timeout_s, stdout=subprocess.PIPE)
     self.assertEqual(result.returncode, 0)
     self.ValidateOutput(result.stdout)
+
+  # Check for graceful failure when the input/output/compute combination is
+  # not supported.
+  def testInputComboFailures(self):
+    args = self.memcpy_gemm_args + [
+        '--gemm',
+        '--input_precision=half',
+        '--output_precision=single',
+        '--compute_precision=double',
+    ]
+    result = subprocess.run(
+        args, timeout=self.timeout_s, stdout=subprocess.PIPE)
+    self.assertEqual(result.returncode, 1)
+
 
 if __name__ == '__main__':
   unittest.main()
